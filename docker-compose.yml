@@ -1,0 +1,66 @@
+services:
+  server:
+    build: .
+    command: >
+      python3 server_app.py
+      --addr 0.0.0.0:8080
+      --vendor_ckpt /app/outputs/central_vendor.pt
+      --clients 10
+      --rounds 50
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./outputs:/app/outputs
+      - ./data:/app/data
+    mem_limit: 2g
+
+  # ---- Client template (anchor only, not a real service) ----
+  client_template: &client_template
+    build: .
+    depends_on:
+      - server
+    volumes:
+      - ./data:/app/data
+    mem_limit: 1g
+    # 안정성 더 필요하면 CPU 제한도 가능
+    # cpus: "1.0"
+
+  client0:
+    <<: *client_template
+    command: python3 client_app.py --cid 0 --clients 10 --server server:8080
+
+  client1:
+    <<: *client_template
+    command: python3 client_app.py --cid 1 --clients 10 --server server:8080
+
+  client2:
+    <<: *client_template
+    command: python3 client_app.py --cid 2 --clients 10 --server server:8080
+
+  client3:
+    <<: *client_template
+    command: python3 client_app.py --cid 3 --clients 10 --server server:8080
+
+  client4:
+    <<: *client_template
+    command: python3 client_app.py --cid 4 --clients 10 --server server:8080
+
+  client5:
+    <<: *client_template
+    command: python3 client_app.py --cid 5 --clients 10 --server server:8080
+
+  client6:
+    <<: *client_template
+    command: python3 client_app.py --cid 6 --clients 10 --server server:8080
+
+  client7:
+    <<: *client_template
+    command: python3 client_app.py --cid 7 --clients 10 --server server:8080
+
+  client8:
+    <<: *client_template
+    command: python3 client_app.py --cid 8 --clients 10 --server server:8080
+
+  client9:
+    <<: *client_template
+    command: python3 client_app.py --cid 9 --clients 10 --server server:8080
