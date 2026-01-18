@@ -1,7 +1,7 @@
-flwr>=1.8.0
 torch
 torchvision
 numpy
-pandas
+flwr
+matplotlib
 scikit-learn
 tqdm
