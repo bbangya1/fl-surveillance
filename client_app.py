@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import flwr as fl
 
@@ -9,8 +10,10 @@ from datasets import load_cifar, split_indices, SynthHealthDataset, make_client_
 from model import build_model
 from train import train_one_epoch, evaluate
 
+
 def get_parameters(model):
     return [val.detach().cpu().numpy() for _, val in model.state_dict().items()]
+
 
 def set_parameters(model, params):
     state_dict = model.state_dict()
@@ -18,11 +21,41 @@ def set_parameters(model, params):
     new_state = {k: torch.tensor(v) for k, v in zip(keys, params)}
     model.load_state_dict(new_state, strict=True)
 
+
+@torch.no_grad()
+def evaluate_with_loss(model, dataloader, device, criterion):
+    """Compute loss + metrics in a stable, version-independent way."""
+    model.eval()
+    total_loss = 0.0
+    total = 0
+
+    for batch in dataloader:
+        # Support both dataset styles:
+        # - (x, y)
+        # - (x, y, meta...)
+        x, y = batch[0], batch[1]
+        x = x.to(device, non_blocking=False)
+        y = y.to(device, non_blocking=False)
+
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        bs = y.size(0)
+        total_loss += loss.item() * bs
+        total += bs
+
+    avg_loss = total_loss / max(1, total)
+
+    # Keep your existing metric implementation (acc, macro_f1)
+    m = evaluate(model, dataloader, device)
+    return avg_loss, m
+
+
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, cid: int, args):
         self.cid = cid
         self.args = args
-        self.device = torch.device("cpu")
+        self.device = get_device()
 
         train_base, test_base = load_cifar(args.data_dir)
         splits = split_indices(len(train_base), args.clients, args.seed)
@@ -32,10 +65,17 @@ class FlowerClient(fl.client.NumPyClient):
         self.ds_train = SynthHealthDataset(train_base, splits[cid], dist, seed=args.seed + cid)
         self.ds_test = SynthHealthDataset(test_base, test_splits[cid], dist, seed=args.seed + 100 + cid)
 
-        self.dl_train = DataLoader(self.ds_train, batch_size=args.batch, shuffle=True, num_workers=0, pin_memory=False)
-        self.dl_test = DataLoader(self.ds_test, batch_size=args.batch, shuffle=False, num_workers=0, pin_memory=False)
+        self.dl_train = DataLoader(
+            self.ds_train, batch_size=args.batch, shuffle=True,
+            num_workers=0, pin_memory=False
+        )
+        self.dl_test = DataLoader(
+            self.ds_test, batch_size=args.batch, shuffle=False,
+            num_workers=0, pin_memory=False
+        )
 
-        self.model = build_model(num_classes=6).to(self.device) 
+        self.model = build_model(num_classes=6).to(self.device)
+        self.criterion = nn.CrossEntropyLoss()
 
     def get_parameters(self, config):
         return get_parameters(self.model)
@@ -49,10 +89,10 @@ class FlowerClient(fl.client.NumPyClient):
 
     def evaluate(self, parameters, config):
         set_parameters(self.model, parameters)
-        m = evaluate(self.model, self.dl_test, self.device)
-        # Flower expects: loss, num_examples, metrics
-        # loss not used here -> set 0
-        return 0.0, len(self.ds_test), {"acc": m["acc"], "macro_f1": m["macro_f1"]}
+        loss, m = evaluate_with_loss(self.model, self.dl_test, self.device, self.criterion)
+        # Flower expects: (loss, num_examples, metrics)
+        return float(loss), len(self.ds_test), {"acc": m["acc"], "macro_f1": m["macro_f1"]}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -69,6 +109,7 @@ def main():
     set_seed(args.seed + args.cid)
     client = FlowerClient(args.cid, args)
     fl.client.start_numpy_client(server_address=args.server, client=client)
+
 
 if __name__ == "__main__":
     main()

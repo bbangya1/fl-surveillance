@@ -11,7 +11,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+# Prefer venv python if exists
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
 DATA_DIR="${DATA_DIR:-./data}"
 OUT_DIR="${OUT_DIR:-./outputs}"
 VENDOR_CKPT="${VENDOR_CKPT:-$OUT_DIR/central_vendor.pt}"
@@ -31,22 +37,25 @@ mkdir -p "$DATA_DIR" "$OUT_DIR"
 
 if [[ ! -f "$VENDOR_CKPT" ]]; then
   echo "[run_fedavg_local] ERROR: vendor checkpoint not found: $VENDOR_CKPT"
-  echo "Run: ./scripts/run_central.sh first"
+  echo "[run_fedavg_local] Hint: run ./scripts/run_central.sh first"
   exit 1
 fi
 
-# Cleanup handler
 PIDS=()
+CLIENT_PIDS=()
+CLIENT_CIDS=()
+
 cleanup() {
   echo ""
   echo "[run_fedavg_local] Cleaning up..."
+  # Try graceful stop
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
   done
-  # Give processes a moment, then force kill if needed
   sleep 1 || true
+  # Force kill
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
       kill -9 "$pid" 2>/dev/null || true
@@ -56,7 +65,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[run_fedavg_local] Starting server at $SERVER_ADDR"
+echo "[run_fedavg_local] python=$PYTHON_BIN"
+echo "[run_fedavg_local] server=$SERVER_ADDR clients=$CLIENTS rounds=$ROUNDS local_epochs=$LOCAL_EPOCHS batch=$BATCH lr=$LR seed=$SEED"
+echo "[run_fedavg_local] logs: $OUT_DIR/server.log, $OUT_DIR/client_*.log"
+echo ""
+
+echo "[run_fedavg_local] Starting server..."
 "$PYTHON_BIN" server_app.py \
   --addr "0.0.0.0:${SERVER_PORT}" \
   --vendor_ckpt "$VENDOR_CKPT" \
@@ -68,8 +82,12 @@ echo "[run_fedavg_local] Starting server at $SERVER_ADDR"
 SERVER_PID=$!
 PIDS+=("$SERVER_PID")
 
-# Wait briefly for server to start
+# Give server a moment, then verify it's still alive
 sleep 2
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "[run_fedavg_local] ERROR: server exited early. See $OUT_DIR/server.log"
+  exit 1
+fi
 
 echo "[run_fedavg_local] Starting $CLIENTS clients..."
 for ((cid=0; cid<CLIENTS; cid++)); do
@@ -83,14 +101,60 @@ for ((cid=0; cid<CLIENTS; cid++)); do
     --local_epochs "$LOCAL_EPOCHS" \
     --seed "$SEED" \
     > "$OUT_DIR/client_${cid}.log" 2>&1 &
-  PIDS+=("$!")
+  pid=$!
+  PIDS+=("$pid")
+  CLIENT_PIDS+=("$pid")
+  CLIENT_CIDS+=("$cid")
 done
 
-echo "[run_fedavg_local] Running. Logs: $OUT_DIR/server.log, $OUT_DIR/client_*.log"
-echo "[run_fedavg_local] Waiting for server to finish rounds=$ROUNDS ..."
+echo ""
+echo "[run_fedavg_local] Monitoring processes..."
 
-# Wait for server; clients will exit when server stops
-wait "$SERVER_PID"
+# Monitor: if any client exits non-zero or server exits early => fail fast
+while true; do
+  # 1) Check server status
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    # server finished or crashed. capture exit code.
+    wait "$SERVER_PID" || {
+      code=$?
+      echo "[run_fedavg_local] ERROR: server exited with code=$code. See $OUT_DIR/server.log"
+      exit 1
+    }
+    # Server exited cleanly: break loop
+    break
+  fi
 
-echo "[run_fedavg_local] Server finished."
-echo "[run_fedavg_local] Expected output model: $OUT_DIR/fedavg_global.pt"
+  # 2) Check clients
+  for i in "${!CLIENT_PIDS[@]}"; do
+    pid="${CLIENT_PIDS[$i]}"
+    cid="${CLIENT_CIDS[$i]}"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # client ended; check exit code
+      if wait "$pid"; then
+        # ok (clients might exit after server finishes)
+        :
+      else
+        code=$?
+        echo "[run_fedavg_local] ERROR: client cid=$cid pid=$pid exited with code=$code"
+        echo "[run_fedavg_local] Hint: check $OUT_DIR/client_${cid}.log"
+        exit 1
+      fi
+      # Remove from monitoring lists (so we don't wait twice)
+      unset 'CLIENT_PIDS[i]'
+      unset 'CLIENT_CIDS[i]'
+      # reindex arrays
+      CLIENT_PIDS=("${CLIENT_PIDS[@]}")
+      CLIENT_CIDS=("${CLIENT_CIDS[@]}")
+      break
+    fi
+  done
+
+  sleep 1
+done
+
+echo ""
+echo "[run_fedavg_local] Server finished cleanly."
+echo "[run_fedavg_local] Outputs:"
+echo "  - Model:   $OUT_DIR/fedavg_global.pt"
+echo "  - Metrics: $OUT_DIR/metrics.csv"
